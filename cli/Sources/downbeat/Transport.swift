@@ -403,18 +403,18 @@ final class Transport: NSObject, @unchecked Sendable {
     }
 
     func announceLive(sampleRate: Double, channels: Int, frameSize: Int,
-                      bufferMs: Double, sourceLabel: String) {
-        let message: [String: Any] = ["t": "cmd", "cmd": [
-            "c": "liveStart",
-            "live": [
-                "sampleRate": sampleRate,
-                "channels": channels,
-                "frameSize": frameSize,
-                "bufferMs": bufferMs,
-                "sourceLabel": sourceLabel,
-                "epoch": liveEpoch,
-            ],
-        ]]
+                      bufferMs: Double, sourceLabel: String, codec: Codec) {
+        var live: [String: Any] = [
+            "sampleRate": sampleRate,
+            "channels": channels,
+            "frameSize": frameSize,
+            "bufferMs": bufferMs,
+            "sourceLabel": sourceLabel,
+            "epoch": liveEpoch,
+            "codec": codec.wireName,
+        ]
+        if codec == .flac24 { live["bitDepth"] = 24 }
+        let message: [String: Any] = ["t": "cmd", "cmd": ["c": "liveStart", "live": live]]
         liveAnnounce = message
         send(json: message)
     }

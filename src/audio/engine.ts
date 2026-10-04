@@ -6,7 +6,7 @@ import {
   plausibleOutputTimestamp,
   saveDeviceOffset,
 } from "./latency";
-import { LIVE_HEADER_BYTES } from "../shared/protocol";
+import { LIVE_HEADER_BYTES, type LiveCodec } from "../shared/protocol";
 import { WORKLET_VERSION } from "../shared/build";
 import { DislocationGuard } from "./dislocation";
 
@@ -488,6 +488,8 @@ export interface LiveConfig {
   channels: number;
   frameSize: number;
   bufferMs: number;
+  /** What the packets are; absent means Opus (sources before 0.5). */
+  codec?: LiveCodec;
 }
 
 export interface LiveStats {
@@ -530,6 +532,87 @@ export interface LiveStats {
 }
 
 /**
+ * A live packet decoder. Every implementation hands back planar Float32 and
+ * the packet's sample index untouched, so the ring never knows the codec.
+ */
+interface LiveSource {
+  readonly kind: string;
+  readonly usable: boolean;
+  decode(packet: Uint8Array, sampleIndex: number): void;
+  close(): void;
+}
+
+type DecodedHandler = (planes: Float32Array[], sampleIndex: number) => void;
+
+function createLiveSource(
+  config: LiveConfig,
+  onDecoded: DecodedHandler,
+  onError: (err: unknown) => void,
+): Promise<LiveSource> {
+  return config.codec === "flac"
+    ? FlacSource.create(onDecoded, onError)
+    : OpusSource.create(config, onDecoded, onError);
+}
+
+/**
+ * Lossless mode: 24-bit FLAC frames, one per packet.
+ *
+ * Always libFLAC-in-WASM, never WebCodecs: browser support for FLAC there is
+ * patchy, and one decoder everywhere is the one `tests/flac-decode.test.ts`
+ * proves bit-exact against the CLI's encoder. It runs in a Web Worker because
+ * at ~1.3 Mbit/s an older phone's main thread has better things to do.
+ * Results come back asynchronously but carry their own sample index, so the
+ * ring places them correctly whatever order they finish in.
+ */
+class FlacSource implements LiveSource {
+  readonly kind = "flac-wasm";
+  private decoder: {
+    decodeFrames(frames: Uint8Array[]): Promise<{ channelData: Float32Array[]; samplesDecoded: number }>;
+    free(): unknown;
+  } | null = null;
+
+  private constructor(
+    private readonly onDecoded: DecodedHandler,
+    private readonly onError: (err: unknown) => void,
+  ) {}
+
+  static async create(onDecoded: DecodedHandler, onError: (err: unknown) => void): Promise<FlacSource> {
+    const { FLACDecoderWebWorker } = await import("@wasm-audio-decoders/flac");
+    const decoder = new FLACDecoderWebWorker();
+    await decoder.ready;
+    const source = new FlacSource(onDecoded, onError);
+    source.decoder = decoder;
+    return source;
+  }
+
+  get usable(): boolean {
+    return this.decoder !== null;
+  }
+
+  decode(packet: Uint8Array, sampleIndex: number): void {
+    const decoder = this.decoder;
+    if (!decoder) return;
+    // The socket's buffer is reused once this handler returns; the worker
+    // needs its own copy.
+    decoder.decodeFrames([packet.slice()]).then(
+      (out) => {
+        if (this.decoder === decoder && out.samplesDecoded > 0) {
+          this.onDecoded(out.channelData, sampleIndex);
+        }
+      },
+      (err) => this.onError(err),
+    );
+  }
+
+  close(): void {
+    const decoder = this.decoder;
+    this.decoder = null;
+    // The worker and its WASM memory are invisible to the GC; free them.
+    void Promise.resolve(decoder?.free()).catch(() => {});
+  }
+}
+
+/**
  * Opus decoding, however this browser can manage it.
  *
  * WebCodecs `AudioDecoder` is the fast native path, but Firefox -- and
@@ -537,7 +620,7 @@ export interface LiveStats {
  * a QR code should not be told their browser is unsupported. libopus compiled
  * to WebAssembly covers everyone else at ~200 KB, loaded only when needed.
  */
-class OpusSource {
+class OpusSource implements LiveSource {
   private webcodec: AudioDecoder | null = null;
   private wasm: { decodeFrame(p: Uint8Array): { channelData: Float32Array[] } } | null = null;
 
@@ -629,7 +712,7 @@ class OpusSource {
 }
 
 export class LivePlayer {
-  private source: OpusSource | null = null;
+  private source: LiveSource | null = null;
   private node: AudioWorkletNode | null = null;
   private config: LiveConfig | null = null;
   private moduleLoaded = false;
@@ -819,7 +902,7 @@ export class LivePlayer {
     this.node = node;
     this.statsTimer = setInterval(() => this.pollStats(), STATS_POLL_MS);
 
-    this.source = await OpusSource.create(
+    this.source = await createLiveSource(
       config,
       (planes, sampleIndex) => this.render(planes, sampleIndex),
       (err) => {
@@ -944,7 +1027,7 @@ export class LivePlayer {
     this.clock.start();
   }
 
-  /** Feed one wire frame: play instant, sample index, then the Opus packet. */
+  /** Feed one wire frame: play instant, sample index, then the codec packet. */
   push(frame: ArrayBuffer): void {
     const source = this.source;
     if (!source?.usable) return;

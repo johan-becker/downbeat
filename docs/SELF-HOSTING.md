@@ -5,8 +5,10 @@ account and point the Mac CLI at it.
 
 ## Requirements
 
-- A Cloudflare account on **Workers Paid** (Durable Objects). R2 and D1 usage
-  fits the free tiers for typical use.
+- A Cloudflare account. The **Workers Free** plan works: `RoomDO` is a
+  SQLite-backed Durable Object, and its 100,000 requests a day cover roughly
+  ten hours of live hosting. R2 must be enabled in the dashboard; R2 and D1
+  usage fits the free tiers for typical use.
 - macOS 15+ on the host Mac, with Xcode command line tools (Swift 6).
 - Listeners need only a modern browser.
 
@@ -56,8 +58,18 @@ The passphrase is stored in `~/.config/downbeat/<host>.passphrase` (mode 0600).
 
 ### Hosting options
 
-While hosting, `m` mutes this Mac, `+` and `-` set its level, and `s` switches
-the captured app without interrupting the room.
+While hosting, `m` mutes this Mac, `+` and `-` set its level, `s` switches
+the captured app without interrupting the room, and `←` / `→` step the Opus
+bitrate through 64 · 100 · 120 · 160 · 256 · 512 kbit/s (default 120). These
+are the steps macOS's Opus encoder offers; it is variable-bitrate, so music
+typically measures 15–25 % below the nominal step. The dashboard shows the
+rate actually sent.
+
+`downbeat host lossless` streams 24-bit FLAC instead: lossless from the Mac's
+output mix onwards (macOS has already resampled the source to the output
+device's rate, usually 48 kHz). Expect ~1.3–1.6 Mbit/s per listener, about
+650 MB an hour on mobile data. It is still 50 packets a second, so the
+Cloudflare request count, and cost, is the same as Opus.
 
 | Flag | Effect |
 | --- | --- |
@@ -67,6 +79,7 @@ the captured app without interrupting the room.
 | `--min-buffer 500` | Floor of the adaptive budget (default 350 ms) |
 | `--no-adapt` | Pin the budget at `--buffer` |
 | `--source Spotify` | Capture one app instead of everything the Mac plays (the default) |
+| `lossless` | 24-bit FLAC instead of Opus, e.g. `downbeat host lossless` |
 | `--takeover` | Take a room already held by another session |
 | `--no-mute` | Leave the source audible locally |
 | `--no-local` | Do not play on this Mac |
@@ -82,10 +95,15 @@ npm test                                   # clock estimator, drift controller, 
 npm run build
 cd cli && swift build -c release
 ./.build/release/downbeat selftest         # Opus encoder against live capture
+./.build/release/downbeat selftest lossless # FLAC round trip, bit-exact
 ./.build/release/downbeat selftest-qr      # renders a QR and decodes it back
 ```
 
 `selftest-qr` feeds the rendered modules back through Vision to confirm that the
 printed pattern is a QR code a phone can scan.
+
+`selftest lossless --dump tests/fixtures/flac-sine.bin` regenerates the fixture
+that `tests/flac-decode.test.ts` decodes with the browser's FLAC decoder;
+redo it whenever the FLAC encoder settings change.
 
 Tagging `v*` builds a universal CLI binary and attaches it to a GitHub release.

@@ -478,6 +478,7 @@ export class RoomConnection {
           channels: live.channels,
           frameSize: live.frameSize,
           bufferMs: live.bufferMs,
+          codec: live.codec,
         });
       } catch (err) {
         this.error = err instanceof Error ? err.message : "live playback unavailable";
