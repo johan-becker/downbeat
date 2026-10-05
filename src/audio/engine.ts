@@ -9,6 +9,7 @@ import {
 import { LIVE_HEADER_BYTES, type LiveCodec } from "../shared/protocol";
 import { WORKLET_VERSION } from "../shared/build";
 import { DislocationGuard } from "./dislocation";
+import { microsToSample, sampleToMicros } from "./timestamps";
 
 /**
  * PlaybackEngine -- decode ahead of time, start on a shared instant, then hold
@@ -628,6 +629,8 @@ class OpusSource implements LiveSource {
     readonly kind: "webcodecs" | "wasm",
     private readonly onDecoded: (planes: Float32Array[], sampleIndex: number) => void,
     private readonly onError: (err: unknown) => void,
+    /** Stream rate, for converting sample indices to WebCodecs microseconds. */
+    private readonly sampleRate = 48000,
   ) {}
 
   static async create(
@@ -636,7 +639,7 @@ class OpusSource implements LiveSource {
     onError: (err: unknown) => void,
   ): Promise<OpusSource> {
     if (typeof AudioDecoder !== "undefined") {
-      const source = new OpusSource("webcodecs", onDecoded, onError);
+      const source = new OpusSource("webcodecs", onDecoded, onError, config.sampleRate);
       const decoder = new AudioDecoder({
         output: (data) => {
           try {
@@ -646,7 +649,7 @@ class OpusSource implements LiveSource {
               data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
               planes.push(plane);
             }
-            onDecoded(planes, data.timestamp);
+            onDecoded(planes, microsToSample(data.timestamp, config.sampleRate));
           } finally {
             data.close();
           }
@@ -680,7 +683,8 @@ class OpusSource implements LiveSource {
       this.webcodec.decode(
         new EncodedAudioChunk({
           type: "key", // every Opus packet stands alone
-          timestamp: sampleIndex, // carried straight through to the sink
+          // Microseconds, never raw samples: see timestamps.ts.
+          timestamp: sampleToMicros(sampleIndex, this.sampleRate),
           data: packet,
         }),
       );
