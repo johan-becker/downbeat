@@ -22,6 +22,23 @@ measurement was taken.
 - `downbeat selftest lossless`: FLAC round trip without capture permissions.
 
 ### Fixed
+- **Chrome heard nothing from a live Opus stream.** WebCodecs timestamps are
+  microseconds, and Chrome derives every output timestamp from the first
+  input plus decoded duration in µs, so a sample index fed in as the
+  timestamp came back advancing 20000 per 20 ms packet instead of 960: the
+  write head ran 20.8× real time, the read head never saw a sample, and the
+  phone showed "Sound stuck" with a cushion of minutes that no tap could fix.
+  Measured in Chrome 153: 40 of 41 decoded packets placed at the wrong sample
+  before, 0 after. Safari passes timestamps through, which is why iPhones and
+  iPads were unaffected.
+- **Android Chrome stopped playing in another app.** Chrome keeps a background
+  tab alive only for an HTMLMediaElement, never for Web Audio, so switching
+  apps froze the page and dropped its socket. Android now loops 10 s of
+  silence through an `<audio>` element (Chrome ignores media under ~5 s) with
+  a media-session notification whose pause/play suspend and resume the
+  speaker; the music itself stays on the AudioContext, so latency and
+  calibration are unchanged. Confirmed on one Android phone: it stayed in the
+  room with a ~300 ms cushion and flat underruns while in another app.
 - Packets are labeled by the encoder's OUTPUT position. The FLAC encoder
   returns each packet one call late, which with input-position labels would
   have played every phone 20 ms behind the host Mac.

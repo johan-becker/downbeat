@@ -10,6 +10,7 @@ import { SyncedClock, type ClockStats } from "./clock";
 import { PlaybackEngine, LivePlayer, type EngineStatus, type LiveStats } from "./engine";
 import { claimPlaybackAudioSession, unlockAudio } from "./latency";
 import { ContextClockWatchdog } from "./watchdog";
+import { BackgroundKeepalive, needsBackgroundKeepalive } from "./background";
 
 export interface RoomSnapshot {
   connected: boolean;
@@ -62,6 +63,8 @@ export class RoomConnection {
   private watchdog = new ContextClockWatchdog(() => this.ctx?.currentTime ?? 0);
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private audioBroken = false;
+  /** Android Chrome only; see background.ts. */
+  private keepalive: BackgroundKeepalive | null = null;
   private telemetryTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Set<Listener>();
@@ -116,6 +119,15 @@ export class RoomConnection {
 
   /** Create the context, engine and live player. Needs a user gesture. */
   private async buildAudio(): Promise<void> {
+    // First, while the gesture is still fresh: play() is gated on it.
+    if (needsBackgroundKeepalive()) {
+      this.keepalive ??= new BackgroundKeepalive(
+        `Room ${this.code}`,
+        () => void this.ctx?.suspend().catch(() => {}),
+        () => void this.wake(),
+      );
+      this.keepalive.start();
+    }
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -218,6 +230,8 @@ export class RoomConnection {
     this.reconnectTimer = null;
     this.watchdogTimer = null;
     this.watchdog.reset();
+    this.keepalive?.stop();
+    this.keepalive = null;
     this.ws?.close();
     this.ws = null;
     this.connected = false;
