@@ -29,6 +29,8 @@ struct Options {
     var adapt = true
     var mute = true
     var playLocally = true
+    /// `downbeat host lossless` switches to FLAC; otherwise Opus on the ladder.
+    var codec: Codec = .defaultOpus
     var passphrase = ProcessInfo.processInfo.environment["DOWNBEAT_PASSPHRASE"] ?? ""
     /// No built-in default: every deployment is self-hosted. Set by
     /// `DOWNBEAT_URL` or `--url`, resolved in `requireServerURL`.
@@ -77,6 +79,7 @@ func parseOptions() -> Options {
         case "--takeover": o.takeover = true
         case "--no-mute": o.mute = false
         case "--no-local": o.playLocally = false
+        case "lossless", "--lossless": o.codec = .flac24
         case "--offline": o.offline = true
         case "-h", "--help":
             printHelp()
@@ -94,6 +97,8 @@ func printHelp() {
 
     COMMANDS
       downbeat host [options]      open a room and stream this Mac
+      downbeat host lossless       the same, as 24-bit FLAC (~1.5 Mbit/s
+                                   per listener instead of ~0.1)
       downbeat login               store the host passphrase once
       downbeat logout              forget the stored passphrase
       downbeat version             version
@@ -117,10 +122,12 @@ func printHelp() {
     KEYS WHILE HOSTING
       m    mute / unmute this Mac        + / -  this Mac's level
       s    switch source (1-8, a = everything, esc)
+      ← →  Opus bitrate: 64 · 100 · 120 · 160 · 256 · 512 kbit/s
       q    quit
 
     DIAGNOSTICS
       downbeat selftest            Opus encoder against live capture
+      downbeat selftest lossless   FLAC round trip, bit-exact, no capture
       downbeat selftest-qr         render a QR and decode it back
     """)
 }
@@ -170,6 +177,11 @@ func requireServerURL(_ url: URL?) -> URL {
 // ------------------------------------------------------------------ commands
 
 if CommandLine.arguments.dropFirst().first == "selftest" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    if args.first == "lossless" {
+        let dump = args.firstIndex(of: "--dump").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+        runLosslessSelfTest(dump: dump)
+    }
     runSelfTest(pid: findProcess(named: "Spotify"), seconds: 3)
 }
 
@@ -257,6 +269,28 @@ let adaptiveBufferMs = Atomic<UInt64>(options.bufferMs.bitPattern)
 /// The budget's rails. An explicit --buffer above 2000 raises the ceiling.
 let minBufferMs = min(options.minBufferMs, options.bufferMs)
 let maxBufferMs = max(2000, options.bufferMs)
+
+/**
+ The Opus bitrate the arrow keys asked for. The encoder thread owns the
+ encoder, so the key thread only leaves the request here; the encoder picks it
+ up before its next packet. Zero in lossless mode, where there is no bitrate.
+ */
+let requestedBitrate: Atomic<Int> = {
+    if case .opus(let b) = options.codec { return Atomic<Int>(b) }
+    return Atomic<Int>(0)
+}()
+
+/// One step along `Codec.opusLadder`; returns the new bitrate, or nil at an end.
+func stepBitrate(_ direction: Int) -> Int? {
+    let current = requestedBitrate.load(ordering: .relaxed)
+    guard current > 0 else { return nil }
+    let ladder = Codec.opusLadder
+    let i = ladder.firstIndex(where: { $0 >= current }) ?? ladder.count - 1
+    let next = i + direction
+    guard ladder.indices.contains(next) else { return nil }
+    requestedBitrate.store(ladder[next], ordering: .relaxed)
+    return ladder[next]
+}
 
 /**
  Capture/encode counters. Lock-free on purpose: the peak is written from the
@@ -506,8 +540,8 @@ if options.playLocally {
 nonisolated(unsafe) var encoderThread: Thread?
 
 if let t = transport {
-    let encoder: OpusEncoder
-    do { encoder = try OpusEncoder(sampleRate: rate, channels: channels) }
+    let encoder: PacketEncoder
+    do { encoder = try PacketEncoder(sampleRate: rate, channels: channels, codec: options.codec) }
     catch { tap.stop(); die("\(error)") }
 
     // Wait briefly for the opening clock burst so the first packets are stamped
@@ -517,7 +551,7 @@ if let t = transport {
 
     t.announceLive(sampleRate: rate, channels: channels,
                    frameSize: encoder.framesPerPacket, bufferMs: options.bufferMs,
-                   sourceLabel: options.sourceLabel)
+                   sourceLabel: options.sourceLabel, codec: options.codec)
 
     // The encoder is owned solely by the thread below; nothing else touches it.
     nonisolated(unsafe) let ownedEncoder = encoder
@@ -530,6 +564,11 @@ if let t = transport {
     let maxDriftMsPerSecond = 2.0
     let thread = Thread {
         var encoded: Int64 = 0
+        /// First frame of the next packet OUT of the encoder. Not `encoded`:
+        /// FLAC returns each packet one call late, and labeling it with the
+        /// input position would play every phone 20 ms behind this Mac.
+        var emitted: Int64 = 0
+        var appliedBitrate = requestedBitrate.load(ordering: .relaxed)
         var streamOffset = clock.offset
         var offsetPrimed = false
         let packetSeconds = Double(frameSize) / rate
@@ -542,6 +581,11 @@ if let t = transport {
                 Thread.sleep(forTimeInterval: 0.005); continue
             }
             ring.read(into: scratch, from: encoded, frames: frameSize)
+            let wanted = requestedBitrate.load(ordering: .relaxed)
+            if wanted != appliedBitrate {
+                ownedEncoder.setBitrate(wanted)
+                appliedBitrate = wanted
+            }
             let packets = (try? ownedEncoder.encode(scratch, frames: frameSize)) ?? []
             for packet in packets {
                 if !offsetPrimed { streamOffset = clock.offset; offsetPrimed = true }
@@ -554,10 +598,11 @@ if let t = transport {
                 streamOffset += max(-maxStep, min(maxStep, target - streamOffset))
                 // This packet's first sample was captured here:
                 let captureRoomMs = anchorLocalMs
-                    + Double(encoded) / rate * 1000
+                    + Double(emitted) / rate * 1000
                     + streamOffset
                 let buffer = Double(bitPattern: adaptiveBufferMs.load(ordering: .relaxed))
-                t.sendPacket(packet, playAtRoomMs: captureRoomMs + buffer, sampleIndex: encoded)
+                t.sendPacket(packet, playAtRoomMs: captureRoomMs + buffer, sampleIndex: emitted)
+                emitted += Int64(frameSize)
                 stats.sent.wrappingAdd(1, ordering: .relaxed)
                 stats.bytes.wrappingAdd(Int64(packet.count), ordering: .relaxed)
             }
@@ -658,6 +703,16 @@ if Terminal.isInteractive {
             switch key {
             case .escape:
                 picker.close()
+            case .arrow(let direction):
+                // Left/right only. Terminals turn wheel and trackpad scrolling
+                // into up/down on the alternate screen, ten at a time -- a
+                // scroll must never be a bitrate change. Lossless has no
+                // bitrate; the dashboard already says so, so stay silent.
+                guard case .opus = options.codec,
+                      direction == .left || direction == .right else { continue }
+                if let b = stepBitrate(direction == .right ? 1 : -1) {
+                    uiLog.add("quality: Opus \(b / 1000) kbit/s")
+                }
             case .char(let c):
                 let k = Character(String(c).lowercased())
                 if picker.get() != nil {
@@ -734,6 +789,10 @@ var lastUnderrunTotal = 0
 var underrunEmergency = false
 let started = RoomClock.localNow()
 var lastPlainPrint = 0.0
+/// The send rate over the last few seconds, so a bitrate step shows within
+/// moments instead of being averaged into the whole session.
+var rateWindow: (at: Double, bytes: Int64) = (RoomClock.localNow(), 0)
+var recentKbits = 0.0
 
 while true {
     Thread.sleep(forTimeInterval: tick)
@@ -779,6 +838,11 @@ while true {
     let bytes = stats.bytes.load(ordering: .relaxed)
 
     let secs = max(1, Int((RoomClock.localNow() - started) / 1000))
+    let nowMs = RoomClock.localNow()
+    if nowMs - rateWindow.at >= 2000 {
+        recentKbits = Double(bytes - rateWindow.bytes) * 8 / (nowMs - rateWindow.at)
+        rateWindow = (nowMs, bytes)
+    }
     let members = membersBox.get()
 
     if Terminal.isInteractive {
@@ -795,7 +859,10 @@ while true {
         state.bufferMs = Double(bitPattern: adaptiveBufferMs.load(ordering: .relaxed))
         state.cushionMs = transport?.minListenerCushionMs ?? .nan
         state.timelineErrMs = timelineErrorMs()
-        state.kbits = Double(bytes) * 8 / Double(secs) / 1000
+        state.kbits = recentKbits
+        let br = requestedBitrate.load(ordering: .relaxed)
+        state.quality = br > 0 ? Codec.opus(bitrate: br).label : options.codec.label
+        state.lossless = br == 0
         state.packets = sent
         state.starved = player?.starvedFrames ?? 0
         state.gain = player?.gain ?? 0
@@ -830,7 +897,7 @@ while true {
             let buf = Double(bitPattern: adaptiveBufferMs.load(ordering: .relaxed))
             print(String(format: "  %@  captured %5.1fs  packets %5d  %5.0f kbit/s  clock %@  buffer %4.0fms  starved %d",
                          db, Double(captured) / rate, sent,
-                         Double(bytes) * 8 / Double(secs) / 1000, sync, buf,
+                         recentKbits, sync, buf,
                          player?.starvedFrames ?? 0))
         }
     }

@@ -15,6 +15,7 @@
 - **Drift correction** a small playback-rate nudge keeps devices together over hours
 - **Live capture** a Core Audio process tap captures any app on the Mac and mutes the original
 - **One native binary** capture, Opus encoding, transport, local playback and dashboard in Swift
+- **Lossless mode** `downbeat host lossless` streams 24-bit FLAC; otherwise ←/→ steps the Opus bitrate live
 - **Realtime-safe playback** decoded audio goes through shared memory straight to the AudioWorklet
 - **Self-hosted** one Worker, one Durable Object, R2 and D1 on your own Cloudflare account
 

@@ -87,13 +87,20 @@ export interface Member {
 /** `arming` = everyone is buffering; `scheduled` = deadline set, waiting for it. */
 export type PlayMode = "idle" | "arming" | "scheduled" | "playing" | "paused";
 
+/** `flac` is `downbeat host lossless`; Opus otherwise. */
+export type LiveCodec = "opus" | "flac";
+
 /** Describes the live stream currently being fed into a room, if any. */
 export interface LiveState {
   active: boolean;
   sampleRate: number;
   channels: number;
-  /** Frames per Opus packet -- 960 at 48 kHz, i.e. 20 ms. */
+  /** Frames per packet, whatever the codec -- 960 at 48 kHz, i.e. 20 ms. */
   frameSize: number;
+  /** Absent from sources older than 0.5, which only spoke Opus. */
+  codec?: LiveCodec;
+  /** Bits per sample of a lossless stream (24); absent for Opus. */
+  bitDepth?: number;
   /** Delay between capture and playout, ms. */
   bufferMs: number;
   /** What is being captured, for the UI. */

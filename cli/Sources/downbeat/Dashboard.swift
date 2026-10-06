@@ -67,7 +67,11 @@ struct DashboardState {
     var bufferMs = 0.0
     var cushionMs = Double.nan
     var timelineErrMs = 0.0
+    /// Send rate over the last few seconds, kbit/s.
     var kbits = 0.0
+    /// What goes on the wire, e.g. "Opus 120 kbit/s".
+    var quality = ""
+    var lossless = false
     var packets: Int64 = 0
     var starved = 0
     var gain = 1.0
@@ -111,7 +115,7 @@ enum Dashboard {
                 lines.append(contentsOf: block)
             }
         }
-        lines.append("  \(B)\(s.code)\(R)   \(D)\(s.joinHost)\(R)")
+        lines.append("  \(B)\(s.code)\(R)   \(D)\(s.joinHost)\(R)   \(s.quality)")
         lines.append("")
 
         // Telemetry: the peak level first — proof the source is alive, one
@@ -169,6 +173,7 @@ enum Dashboard {
         lines = Array(lines.prefix(rows - 1))
         let gain = "\(Int((s.gain * 100).rounded()))%"
         let keys = "\(B)q\(R)\(D) quit\(R)  \(B)m\(R)\(D) \(s.muted ? "unmute" : "mute")\(R)  \(B)±\(R)\(D) \(gain)\(R)  \(B)s\(R)\(D) source\(R)"
+            + (s.lossless ? "" : "  \(B)←→\(R)\(D) quality\(R)")
         let note = s.stopping ? "stopping — the source becomes audible again…"
                               : (s.muted ? "host muted" : "")
         lines.append(pad(keys, D + note + R, cols: cols))

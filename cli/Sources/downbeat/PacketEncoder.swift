@@ -1,19 +1,49 @@
 import Foundation
 import AudioToolbox
 
-/**
- Opus encoding via AudioToolbox.
+/// What goes on the wire. Opus is the default; FLAC is `downbeat host lossless`.
+enum Codec: Sendable, Equatable {
+    case opus(bitrate: Int)
+    /// 24-bit FLAC: lossless from the Mac's output mix onwards.
+    case flac24
 
- macOS ships an Opus encoder (it appears in `kAudioFormatProperty_EncodeFormatIDs`),
- so the CLI needs no libopus, no Homebrew, and stays a self-contained binary.
- Opus is also the codec WebCodecs `AudioDecoder` handles on every browser we
- target, so the packets go on the wire exactly as produced.
+    /// The bitrates macOS's Opus encoder actually offers in the useful range
+    /// (`kAudioConverterApplicableEncodeBitRates`). It accepts any number, but
+    /// 128 or 192 silently become a neighboring step -- so the ladder is these.
+    static let opusLadder = [64_000, 100_000, 120_000, 160_000, 256_000, 512_000]
+    static let defaultOpus = Codec.opus(bitrate: 120_000)
+
+    /// `codec` as announced in `liveStart`.
+    var wireName: String {
+        switch self {
+        case .opus: "opus"
+        case .flac24: "flac"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .opus(let b): "Opus \(b / 1000) kbit/s"
+        case .flac24: "FLAC 24-bit lossless"
+        }
+    }
+}
+
+/**
+ Opus or FLAC encoding via AudioToolbox.
+
+ macOS ships both encoders (they appear in `kAudioFormatProperty_EncodeFormatIDs`),
+ so the CLI needs no libopus, no libFLAC, no Homebrew, and stays a
+ self-contained binary. Both are asked for 20 ms packets, so the wire carries
+ the same 50 packets a second either way and nothing downstream of the encoder
+ -- headers, sample indices, relay, worklet -- knows which codec is running.
  */
-final class OpusEncoder {
+final class PacketEncoder {
     private var converter: AudioConverterRef?
     private let inputChannels: Int
+    let codec: Codec
     private(set) var framesPerPacket: Int = 0
-    private let maxPacketBytes = 4000
+    private var maxPacketBytes = 4000
 
     /// Interleaved Float32 waiting to be consumed by the converter callback.
     private var pending: UnsafeMutablePointer<Float>
@@ -21,19 +51,20 @@ final class OpusEncoder {
     private var pendingCapacity: Int
 
     enum EncoderError: Error, CustomStringConvertible {
-        case createFailed(OSStatus)
+        case createFailed(String, OSStatus)
         case bitrateFailed(OSStatus)
         case encodeFailed(OSStatus)
         var description: String {
             switch self {
-            case .createFailed(let s): "Opus encoder unavailable (OSStatus \(s))"
+            case .createFailed(let name, let s): "\(name) encoder unavailable (OSStatus \(s))"
             case .bitrateFailed(let s): "could not set the bitrate (OSStatus \(s))"
-            case .encodeFailed(let s): "Opus encoding failed (OSStatus \(s))"
+            case .encodeFailed(let s): "encoding failed (OSStatus \(s))"
             }
         }
     }
 
-    init(sampleRate: Double, channels: Int, bitrate: Int = 128_000) throws {
+    init(sampleRate: Double, channels: Int, codec: Codec = .defaultOpus) throws {
+        self.codec = codec
         inputChannels = channels
         pendingCapacity = 48_000 * channels
         pending = .allocate(capacity: pendingCapacity)
@@ -54,26 +85,54 @@ final class OpusEncoder {
             mFormatID: kAudioFormatOpus,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
-            mFramesPerPacket: 0,   // let the encoder choose its packet length
+            mFramesPerPacket: 0,   // Opus picks 960 (20 ms at 48 kHz) itself
             mBytesPerFrame: 0,
             mChannelsPerFrame: UInt32(channels),
             mBitsPerChannel: 0,
             mReserved: 0)
+        if codec == .flac24 {
+            // Left alone, the FLAC encoder makes 4608-frame packets (~96 ms).
+            // Asking for 960 keeps the wire at Opus's cadence, which is what
+            // the relay's cost and the receiver's buffering are sized for.
+            output.mFormatID = kAudioFormatFLAC
+            output.mFormatFlags = kAppleLosslessFormatFlag_24BitSourceData
+            output.mFramesPerPacket = 960
+        }
 
         let status = AudioConverterNew(&input, &output, &converter)
-        guard status == noErr, converter != nil else { throw EncoderError.createFailed(status) }
+        guard status == noErr, converter != nil else {
+            throw EncoderError.createFailed(codec.wireName, status)
+        }
 
-        var rate = UInt32(bitrate)
-        let brStatus = AudioConverterSetProperty(converter!, kAudioConverterEncodeBitRate,
-                                                 UInt32(MemoryLayout<UInt32>.size), &rate)
-        // Not every encoder accepts an explicit bitrate; its default is fine.
-        if brStatus != noErr { NSLog("downbeat: bitrate not set (\(brStatus)), using the default") }
+        if case .opus(let bitrate) = codec { setBitrate(bitrate) }
 
         var actual = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         AudioConverterGetProperty(converter!, kAudioConverterCurrentOutputStreamDescription, &size, &actual)
         framesPerPacket = Int(actual.mFramesPerPacket)
         if framesPerPacket == 0 { framesPerPacket = 960 }  // 20 ms at 48 kHz
+
+        // A 24-bit FLAC packet of noise-like audio can exceed the fixed buffer
+        // Opus never comes close to; ask the converter for its real worst case.
+        var maxOut: UInt32 = 0
+        var maxSize = UInt32(MemoryLayout<UInt32>.size)
+        if AudioConverterGetProperty(converter!, kAudioConverterPropertyMaximumOutputPacketSize,
+                                     &maxSize, &maxOut) == noErr, maxOut > 0 {
+            maxPacketBytes = max(maxPacketBytes, Int(maxOut))
+        }
+    }
+
+    /// Opus only; takes effect from the next packet. Opus packets stand alone,
+    /// so a change mid-stream needs nothing from the receivers.
+    @discardableResult
+    func setBitrate(_ bitrate: Int) -> Bool {
+        guard let converter, case .opus = codec else { return false }
+        var rate = UInt32(bitrate)
+        let st = AudioConverterSetProperty(converter, kAudioConverterEncodeBitRate,
+                                           UInt32(MemoryLayout<UInt32>.size), &rate)
+        // Not every encoder accepts an explicit bitrate; its default is fine.
+        if st != noErr { NSLog("downbeat: bitrate not set (\(st)), using the default") }
+        return st == noErr
     }
 
     deinit {
@@ -82,11 +141,13 @@ final class OpusEncoder {
     }
 
     /**
-     Feed interleaved Float32 and receive whole Opus packets.
+     Feed interleaved Float32 and receive whole packets.
 
      Returns one `Data` per packet, each covering exactly `framesPerPacket`
      frames, so the caller can label packets by absolute sample index and never
-     has to trust a per-packet timestamp.
+     has to trust a per-packet timestamp. Packets come out in order but may lag
+     the input (FLAC by one packet): the n-th packet ever returned starts at
+     frame `n * framesPerPacket`, whichever call returned it.
      */
     func encode(_ samples: UnsafePointer<Float>, frames: Int) throws -> [Data] {
         guard let converter else { return [] }
@@ -123,9 +184,14 @@ final class OpusEncoder {
                 }
             }
             guard status == noErr || status == kFillDone else { throw EncoderError.encodeFailed(status) }
-            if packetCount == 0 { break }
-
-            packets.append(Data(buffer[0..<Int(desc.mDataByteSize)]))
+            if packetCount > 0 {
+                packets.append(Data(buffer[0..<Int(desc.mDataByteSize)]))
+            }
+            // The FLAC encoder holds one packet back: the first call swallows
+            // its input and returns nothing, every later call returns the
+            // previous packet. Input the converter took is gone either way,
+            // and must not be fed to it a second time.
+            guard context.consumed else { break }
 
             let leftover = pendingFrames - framesPerPacket
             if leftover > 0 {

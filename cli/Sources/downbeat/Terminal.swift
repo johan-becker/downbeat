@@ -91,9 +91,12 @@ enum Terminal {
         }
     }
 
+    enum Direction { case up, down, left, right }
+
     enum Key {
         case char(Character)
         case escape
+        case arrow(Direction)
     }
 
     /// Blocking-ish read of one key press; nil on timeout.
@@ -103,15 +106,27 @@ enum Terminal {
         guard n == 1 else { return nil }
         if byte == 0x1b {
             // Escape, or the start of a sequence (arrows etc.). The 0.1 s
-            // VTIME window separates them; sequences are read and dropped.
+            // VTIME window separates them; arrows are kept, other sequences
+            // are read and dropped.
             var next: UInt8 = 0
             if read(STDIN_FILENO, &next, 1) == 1 {
                 if next == UInt8(ascii: "[") || next == UInt8(ascii: "O") {
                     var rest: UInt8 = 0
+                    var params = 0
                     while read(STDIN_FILENO, &rest, 1) == 1 {
                         if (0x40...0x7e).contains(rest) { break }
+                        params += 1
                     }
-                    return nil
+                    // Bare `ESC [ A` only: a modified arrow (`ESC [ 1 ; 2 A`)
+                    // is someone's shortcut, not a bitrate step.
+                    guard params == 0 else { return nil }
+                    switch rest {
+                    case UInt8(ascii: "A"): return .arrow(.up)
+                    case UInt8(ascii: "B"): return .arrow(.down)
+                    case UInt8(ascii: "C"): return .arrow(.right)
+                    case UInt8(ascii: "D"): return .arrow(.left)
+                    default: return nil
+                    }
                 }
                 return .char(Character(UnicodeScalar(next)))
             }

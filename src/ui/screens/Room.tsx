@@ -124,6 +124,7 @@ export function Room({ code, hostToken }: { code: string; hostToken: string | nu
                 <div className="wordmark text-5xl text-pulse">LIVE</div>
                 <div className="mt-2 text-[11px] uppercase tracking-[0.3em] text-muted">
                   {live.sourceLabel}
+                  {live.codec === "flac" && <span className="text-pulse"> · lossless</span>}
                 </div>
               </div>
             </div>
